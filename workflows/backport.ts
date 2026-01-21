@@ -8,6 +8,7 @@ import {
   type DiffAnalysis,
   type BackportAnalysis,
 } from "@/lib/ai";
+import { executeBackport, getGitCredentials } from "@/lib/sandbox";
 
 export interface BackportParams {
   jobId: string;
@@ -121,9 +122,11 @@ export async function backportPullRequest(
     const backportResult = await performBackport(
       installationId,
       repository,
+      prNumber,
       prDetails,
       targetBranch,
-      analysis
+      analysis,
+      jobId
     );
 
     // Step 6: Create result PR or report failure
@@ -323,17 +326,42 @@ async function analyzeChangesWithAI(
 async function performBackport(
   installationId: number,
   repository: string,
+  prNumber: number,
   prDetails: PRDetails,
   targetBranch: string,
-  analysis: AnalysisResult
+  analysis: AnalysisResult,
+  jobId: string
 ): Promise<{ success: boolean; branch?: string; error?: string }> {
   "use step";
-  // TODO: Implement sandbox-based git operations in Phase 6
-  // For now, return a placeholder error
-  return {
-    success: false,
-    error: "Backport execution not yet implemented (coming in Phase 6)",
-  };
+
+  const octokit = await getInstallationOctokit(installationId);
+
+  // Get git credentials for sandbox operations
+  const gitCredentials = await getGitCredentials(octokit);
+
+  // Execute backport in sandbox
+  const result = await executeBackport(
+    {
+      repository,
+      targetBranch,
+      commits: prDetails.commits,
+      prNumber,
+      diffAnalysis: analysis.diffAnalysis,
+      gitCredentials,
+    },
+    async (message) => {
+      await addJobLog(jobId, `[Sandbox] ${message}`);
+    }
+  );
+
+  if (result.resolvedConflicts && result.resolvedConflicts > 0) {
+    await addJobLog(
+      jobId,
+      `AI resolved ${result.resolvedConflicts} conflict(s) automatically`
+    );
+  }
+
+  return result;
 }
 
 async function createBackportPR(
