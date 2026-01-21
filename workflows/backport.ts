@@ -1,6 +1,13 @@
 import { sleep, FatalError } from "workflow";
 import { getInstallationOctokit } from "@/lib/github";
 import { updateJob, addJobLog } from "@/lib/jobs";
+import {
+  analyzeDiff,
+  analyzeBackportFeasibility,
+  generateBackportPRDescription,
+  type DiffAnalysis,
+  type BackportAnalysis,
+} from "@/lib/ai";
 
 export interface BackportParams {
   jobId: string;
@@ -17,12 +24,29 @@ export interface BackportResult {
   error?: string;
 }
 
+interface PRDetails {
+  title: string;
+  body: string | null;
+  baseBranch: string;
+  headBranch: string;
+  headSha: string;
+  commits: Array<{ sha: string; message: string }>;
+  merged: boolean;
+  mergeCommitSha: string | null;
+  diff: string;
+}
+
+interface AnalysisResult {
+  diffAnalysis: DiffAnalysis;
+  backportAnalysis: BackportAnalysis;
+}
+
 /**
  * Main backport workflow
  *
  * This workflow handles the entire backport process:
  * 1. Fetch PR details and commits
- * 2. Analyze the changes and target branch
+ * 2. Analyze the changes and target branch with AI
  * 3. Create a sandbox and perform git operations
  * 4. Handle any conflicts with AI assistance
  * 5. Create the result PR or report failure
@@ -48,13 +72,49 @@ export async function backportPullRequest(
 
     // Step 3: Validate target branch exists
     await addJobLog(jobId, `Validating target branch: ${targetBranch}`);
-    await validateTargetBranch(installationId, repository, targetBranch);
+    const targetBranchInfo = await validateTargetBranch(
+      installationId,
+      repository,
+      targetBranch
+    );
     await addJobLog(jobId, "Target branch exists");
 
-    // Step 4: Analyze the changes (AI-powered)
-    await addJobLog(jobId, "Analyzing changes...");
-    const analysis = await analyzeChanges(prDetails, targetBranch);
-    await addJobLog(jobId, `Analysis complete. Complexity: ${analysis.complexity}`);
+    // Step 4: Analyze the changes with AI
+    await addJobLog(jobId, "Analyzing changes with AI...");
+    const analysis = await analyzeChangesWithAI(
+      prDetails,
+      targetBranch,
+      targetBranchInfo.context
+    );
+    await addJobLog(jobId, `AI Analysis complete:`);
+    await addJobLog(jobId, `  - Change type: ${analysis.diffAnalysis.changeType}`);
+    await addJobLog(jobId, `  - Complexity: ${analysis.diffAnalysis.complexity}`);
+    await addJobLog(jobId, `  - Can backport: ${analysis.backportAnalysis.canBackport}`);
+    await addJobLog(
+      jobId,
+      `  - Confidence: ${Math.round(analysis.backportAnalysis.confidence * 100)}%`
+    );
+    await addJobLog(
+      jobId,
+      `  - Estimated effort: ${analysis.backportAnalysis.estimatedEffort}`
+    );
+
+    // Check if AI thinks backport is not feasible
+    if (
+      !analysis.backportAnalysis.canBackport &&
+      analysis.backportAnalysis.confidence > 0.8
+    ) {
+      const reasons = analysis.backportAnalysis.potentialConflicts
+        .map((c) => `- ${c.file}: ${c.reason}`)
+        .join("\n");
+      const error = `AI analysis indicates this backport may not be feasible:\n${reasons}\n\nRecommendations:\n${analysis.backportAnalysis.recommendations.join("\n")}`;
+
+      await addJobLog(jobId, `Backport not recommended by AI: ${error}`);
+      await reportFailure(installationId, repository, prNumber, targetBranch, error);
+      await updateJob(jobId, { status: "failed", error });
+
+      return { success: false, error };
+    }
 
     // Step 5: Perform the backport in a sandbox
     await addJobLog(jobId, "Performing backport in sandbox...");
@@ -69,12 +129,23 @@ export async function backportPullRequest(
     // Step 6: Create result PR or report failure
     if (backportResult.success) {
       await addJobLog(jobId, "Backport successful, creating PR...");
+
+      // Generate AI-powered PR description
+      const prDescription = await generateBackportPRDescription(
+        { title: prDetails.title, number: prNumber, body: prDetails.body },
+        repository,
+        targetBranch,
+        analysis.diffAnalysis,
+        analysis.backportAnalysis
+      );
+
       const resultPR = await createBackportPR(
         installationId,
         repository,
         prNumber,
         targetBranch,
-        backportResult.branch!
+        backportResult.branch!,
+        prDescription
       );
 
       await reportSuccess(
@@ -146,7 +217,7 @@ async function fetchPRDetails(
   installationId: number,
   repository: string,
   prNumber: number
-) {
+): Promise<PRDetails> {
   "use step";
   const octokit = await getInstallationOctokit(installationId);
   const [owner, repo] = repository.split("/");
@@ -163,7 +234,7 @@ async function fetchPRDetails(
     pull_number: prNumber,
   });
 
-  // Also get the diff for AI analysis
+  // Get the diff for AI analysis
   const { data: diff } = await octokit.rest.pulls.get({
     owner,
     repo,
@@ -193,42 +264,68 @@ async function validateTargetBranch(
   installationId: number,
   repository: string,
   targetBranch: string
-) {
+): Promise<{ sha: string; context: string }> {
   "use step";
   const octokit = await getInstallationOctokit(installationId);
   const [owner, repo] = repository.split("/");
 
   try {
-    await octokit.rest.repos.getBranch({
+    const { data: branch } = await octokit.rest.repos.getBranch({
       owner,
       repo,
       branch: targetBranch,
     });
+
+    // Get some context about the target branch (recent commits)
+    const { data: commits } = await octokit.rest.repos.listCommits({
+      owner,
+      repo,
+      sha: targetBranch,
+      per_page: 5,
+    });
+
+    const context = `Target branch: ${targetBranch}\nRecent commits:\n${commits
+      .map((c) => `- ${c.sha.slice(0, 7)}: ${c.commit.message.split("\n")[0]}`)
+      .join("\n")}`;
+
+    return { sha: branch.commit.sha, context };
   } catch (error) {
     throw new FatalError(`Target branch '${targetBranch}' does not exist`);
   }
 }
 
-async function analyzeChanges(prDetails: any, targetBranch: string) {
+async function analyzeChangesWithAI(
+  prDetails: PRDetails,
+  targetBranch: string,
+  targetBranchContext: string
+): Promise<AnalysisResult> {
   "use step";
-  // TODO: Implement AI-powered analysis in Phase 5
-  // For now, return a basic analysis
-  const filesChanged = (prDetails.diff?.match(/^diff --git/gm) || []).length;
 
-  return {
-    complexity: filesChanged > 10 ? "high" : filesChanged > 3 ? "medium" : "low",
-    filesChanged,
-    potentialConflicts: [],
-    recommendations: [],
-  };
+  // First, analyze the diff
+  const diffAnalysis = await analyzeDiff(
+    prDetails.diff,
+    prDetails.title,
+    prDetails.body
+  );
+
+  // Then, analyze backport feasibility
+  const backportAnalysis = await analyzeBackportFeasibility(
+    prDetails.diff,
+    diffAnalysis,
+    prDetails.baseBranch,
+    targetBranch,
+    targetBranchContext
+  );
+
+  return { diffAnalysis, backportAnalysis };
 }
 
 async function performBackport(
   installationId: number,
   repository: string,
-  prDetails: any,
+  prDetails: PRDetails,
   targetBranch: string,
-  analysis: any
+  analysis: AnalysisResult
 ): Promise<{ success: boolean; branch?: string; error?: string }> {
   "use step";
   // TODO: Implement sandbox-based git operations in Phase 6
@@ -244,7 +341,8 @@ async function createBackportPR(
   repository: string,
   sourcePR: number,
   targetBranch: string,
-  backportBranch: string
+  backportBranch: string,
+  description: string
 ): Promise<number> {
   "use step";
   const octokit = await getInstallationOctokit(installationId);
@@ -256,7 +354,7 @@ async function createBackportPR(
     title: `[Backport ${targetBranch}] Changes from #${sourcePR}`,
     head: backportBranch,
     base: targetBranch,
-    body: `This is an automated backport of #${sourcePR} to \`${targetBranch}\`.\n\nCreated by agent-backport.`,
+    body: description,
   });
 
   return pr.number;
@@ -273,7 +371,6 @@ async function reportSuccess(
   const octokit = await getInstallationOctokit(installationId);
   const [owner, repo] = repository.split("/");
 
-  // Add rocket reaction to original comment
   await octokit.rest.issues.createComment({
     owner,
     repo,
