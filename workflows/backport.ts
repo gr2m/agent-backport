@@ -156,7 +156,8 @@ export async function backportPullRequest(
         repository,
         prNumber,
         resultPR,
-        targetBranch
+        targetBranch,
+        backportResult.resolvedConflicts
       );
 
       await updateJob(jobId, {
@@ -331,7 +332,7 @@ async function performBackport(
   targetBranch: string,
   analysis: AnalysisResult,
   jobId: string
-): Promise<{ success: boolean; branch?: string; error?: string }> {
+): Promise<{ success: boolean; branch?: string; error?: string; resolvedConflicts?: number }> {
   "use step";
 
   const octokit = await getInstallationOctokit(installationId);
@@ -393,17 +394,29 @@ async function reportSuccess(
   repository: string,
   prNumber: number,
   resultPR: number,
-  targetBranch: string
+  targetBranch: string,
+  resolvedConflicts?: number
 ) {
   "use step";
   const octokit = await getInstallationOctokit(installationId);
   const [owner, repo] = repository.split("/");
 
+  let message = `## ✅ Backport Successful\n\n`;
+  message += `Successfully backported to \`${targetBranch}\`.\n\n`;
+  message += `**Result:** #${resultPR}\n`;
+
+  if (resolvedConflicts && resolvedConflicts > 0) {
+    message += `\n> **Note:** ${resolvedConflicts} conflict(s) were automatically resolved by AI.\n`;
+    message += `> Please review the changes carefully before merging.\n`;
+  }
+
+  message += `\n---\n<sub>Created by [agent-backport](https://github.com/gr2m/agent-backport)</sub>`;
+
   await octokit.rest.issues.createComment({
     owner,
     repo,
     issue_number: prNumber,
-    body: `✅ Successfully backported to \`${targetBranch}\`!\n\nSee #${resultPR}`,
+    body: message,
   });
 }
 
@@ -418,10 +431,22 @@ async function reportFailure(
   const octokit = await getInstallationOctokit(installationId);
   const [owner, repo] = repository.split("/");
 
+  let message = `## ❌ Backport Failed\n\n`;
+  message += `Failed to backport to \`${targetBranch}\`.\n\n`;
+  message += `**Error:**\n\`\`\`\n${error}\n\`\`\`\n\n`;
+  message += `### Manual Backport Instructions\n\n`;
+  message += `\`\`\`bash\n`;
+  message += `git fetch origin ${targetBranch}\n`;
+  message += `git checkout -b backport-pr-${prNumber}-to-${targetBranch} origin/${targetBranch}\n`;
+  message += `git cherry-pick -x <commit-sha>  # Cherry-pick each commit from this PR\n`;
+  message += `git push origin backport-pr-${prNumber}-to-${targetBranch}\n`;
+  message += `\`\`\`\n\n`;
+  message += `---\n<sub>Created by [agent-backport](https://github.com/gr2m/agent-backport)</sub>`;
+
   await octokit.rest.issues.createComment({
     owner,
     repo,
     issue_number: prNumber,
-    body: `❌ Failed to backport to \`${targetBranch}\`.\n\n**Error:** ${error}\n\nPlease try backporting manually.`,
+    body: message,
   });
 }

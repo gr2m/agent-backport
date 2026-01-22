@@ -1,0 +1,16 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "buildCommand": "npm run build",
+  "devCommand": "npm run dev",
+  "installCommand": "npm install",
+  "functions": {
+    "app/api/github/webhooks/route.ts": {
+      "maxDuration": 60
+    },
+    "app/.well-known/workflow/**/*.ts": {
+      "maxDuration": 300
+    }
+  },
+  "crons": []
+}
