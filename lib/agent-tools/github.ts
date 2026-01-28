@@ -197,10 +197,88 @@ export const postComment = tool({
   },
 });
 
+/**
+ * Update an existing comment
+ */
+export const updateComment = tool({
+  description: "Update an existing comment on a pull request",
+  inputSchema: z.object({
+    commentId: z.number().describe("The comment ID to update"),
+    body: z.string().describe("The new comment body (supports markdown)"),
+  }),
+  execute: async function ({ commentId, body }, { experimental_context }) {
+    "use step";
+    const { installationId, repository } = experimental_context as GitHubToolContext;
+    const octokit = await getInstallationOctokit(installationId);
+    const [owner, repo] = repository.split("/");
+
+    const { data: comment } = await octokit.rest.issues.updateComment({
+      owner,
+      repo,
+      comment_id: commentId,
+      body,
+    });
+
+    return {
+      id: comment.id,
+      url: comment.html_url,
+    };
+  },
+});
+
+/**
+ * Create a progress comment with initial checklist
+ */
+export const createProgressComment = tool({
+  description: "Create a progress comment with a task checklist that can be updated as the backport progresses",
+  inputSchema: z.object({
+    prNumber: z.number().describe("The pull request number to comment on"),
+    targetBranch: z.string().describe("The target branch for the backport"),
+    jobUrl: z.string().optional().describe("Optional URL to the job logs"),
+  }),
+  execute: async function ({ prNumber, targetBranch, jobUrl }, { experimental_context }) {
+    "use step";
+    const { installationId, repository } = experimental_context as GitHubToolContext;
+    const octokit = await getInstallationOctokit(installationId);
+    const [owner, repo] = repository.split("/");
+
+    const footer = jobUrl
+      ? `---\n<sub>[agent-backport](https://github.com/gr2m/agent-backport) • [View logs](${jobUrl})</sub>`
+      : `---\n<sub>[agent-backport](https://github.com/gr2m/agent-backport)</sub>`;
+
+    const body = `## Backport in Progress
+
+- [x] Acknowledged request
+- [ ] Fetching PR details
+- [ ] Validating target branch \`${targetBranch}\`
+- [ ] Analyzing changes
+- [ ] Executing backport
+- [ ] Creating PR
+
+⏳ **Status:** Starting backport...
+
+${footer}`;
+
+    const { data: comment } = await octokit.rest.issues.createComment({
+      owner,
+      repo,
+      issue_number: prNumber,
+      body,
+    });
+
+    return {
+      id: comment.id,
+      url: comment.html_url,
+    };
+  },
+});
+
 export const githubTools = {
   fetchPRDetails,
   validateBranch,
   createPullRequest,
   addReaction,
   postComment,
+  updateComment,
+  createProgressComment,
 };
