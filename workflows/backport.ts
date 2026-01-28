@@ -1,14 +1,14 @@
-import { sleep, FatalError } from "workflow";
-import { getInstallationOctokit } from "@/lib/github";
-import { updateJob, addJobLog } from "@/lib/jobs";
+import { DurableAgent } from "@workflow/ai/agent";
+import { getWritable } from "workflow";
+import type { UIMessageChunk } from "ai";
 import {
-  analyzeDiff,
-  analyzeBackportFeasibility,
-  generateBackportPRDescription,
-  type DiffAnalysis,
-  type BackportAnalysis,
-} from "@/lib/ai";
-import { executeBackport, getGitCredentials } from "@/lib/sandbox";
+  githubTools,
+  sandboxTools,
+  analysisTools,
+  loggingTools,
+  BACKPORT_AGENT_SYSTEM_PROMPT,
+  type AgentToolContext,
+} from "@/lib/agent-tools";
 
 export interface BackportParams {
   jobId: string;
@@ -25,32 +25,15 @@ export interface BackportResult {
   error?: string;
 }
 
-interface PRDetails {
-  title: string;
-  body: string | null;
-  baseBranch: string;
-  headBranch: string;
-  headSha: string;
-  commits: Array<{ sha: string; message: string }>;
-  merged: boolean;
-  mergeCommitSha: string | null;
-  diff: string;
-}
-
-interface AnalysisResult {
-  diffAnalysis: DiffAnalysis;
-  backportAnalysis: BackportAnalysis;
-}
-
 /**
- * Main backport workflow
+ * Main backport workflow using DurableAgent
  *
- * This workflow handles the entire backport process:
- * 1. Fetch PR details and commits
- * 2. Analyze the changes and target branch with AI
- * 3. Create a sandbox and perform git operations
- * 4. Handle any conflicts with AI assistance
- * 5. Create the result PR or report failure
+ * The agent autonomously handles the entire backport process:
+ * 1. Acknowledges the request with eyes reaction
+ * 2. Fetches PR details and validates target branch
+ * 3. Analyzes changes and backport feasibility with AI
+ * 4. Executes the backport in a sandbox (cherry-pick, conflict resolution)
+ * 5. Creates the result PR or reports failure
  */
 export async function backportPullRequest(
   params: BackportParams
@@ -60,393 +43,141 @@ export async function backportPullRequest(
   const { jobId, installationId, repository, prNumber, targetBranch, commentId } =
     params;
 
-  try {
-    // Step 1: Acknowledge the request
-    await acknowledgeRequest(installationId, repository, commentId);
-    await addJobLog(jobId, "Request acknowledged");
-
-    // Step 2: Fetch PR details
-    await addJobLog(jobId, "Fetching PR details...");
-    const prDetails = await fetchPRDetails(installationId, repository, prNumber);
-    await addJobLog(jobId, `PR title: ${prDetails.title}`);
-    await addJobLog(jobId, `Commits: ${prDetails.commits.length}`);
-
-    // Step 3: Validate target branch exists
-    await addJobLog(jobId, `Validating target branch: ${targetBranch}`);
-    const targetBranchInfo = await validateTargetBranch(
-      installationId,
-      repository,
-      targetBranch
-    );
-    await addJobLog(jobId, "Target branch exists");
-
-    // Step 4: Analyze the changes with AI
-    await addJobLog(jobId, "Analyzing changes with AI...");
-    const analysis = await analyzeChangesWithAI(
-      prDetails,
-      targetBranch,
-      targetBranchInfo.context
-    );
-    await addJobLog(jobId, `AI Analysis complete:`);
-    await addJobLog(jobId, `  - Change type: ${analysis.diffAnalysis.changeType}`);
-    await addJobLog(jobId, `  - Complexity: ${analysis.diffAnalysis.complexity}`);
-    await addJobLog(jobId, `  - Can backport: ${analysis.backportAnalysis.canBackport}`);
-    await addJobLog(
-      jobId,
-      `  - Confidence: ${Math.round(analysis.backportAnalysis.confidence * 100)}%`
-    );
-    await addJobLog(
-      jobId,
-      `  - Estimated effort: ${analysis.backportAnalysis.estimatedEffort}`
-    );
-
-    // Check if AI thinks backport is not feasible
-    if (
-      !analysis.backportAnalysis.canBackport &&
-      analysis.backportAnalysis.confidence > 0.8
-    ) {
-      const reasons = analysis.backportAnalysis.potentialConflicts
-        .map((c) => `- ${c.file}: ${c.reason}`)
-        .join("\n");
-      const error = `AI analysis indicates this backport may not be feasible:\n${reasons}\n\nRecommendations:\n${analysis.backportAnalysis.recommendations.join("\n")}`;
-
-      await addJobLog(jobId, `Backport not recommended by AI: ${error}`);
-      await reportFailure(installationId, repository, prNumber, targetBranch, error);
-      await updateJob(jobId, { status: "failed", error });
-
-      return { success: false, error };
-    }
-
-    // Step 5: Perform the backport in a sandbox
-    await addJobLog(jobId, "Performing backport in sandbox...");
-    const backportResult = await performBackport(
-      installationId,
-      repository,
-      prNumber,
-      prDetails,
-      targetBranch,
-      analysis,
-      jobId
-    );
-
-    // Step 6: Create result PR or report failure
-    if (backportResult.success) {
-      await addJobLog(jobId, "Backport successful, creating PR...");
-
-      // Generate AI-powered PR description
-      const prDescription = await generateBackportPRDescription(
-        { title: prDetails.title, number: prNumber, body: prDetails.body },
-        repository,
-        targetBranch,
-        analysis.diffAnalysis,
-        analysis.backportAnalysis
-      );
-
-      const resultPR = await createBackportPR(
-        installationId,
-        repository,
-        prNumber,
-        targetBranch,
-        backportResult.branch!,
-        prDescription
-      );
-
-      await reportSuccess(
-        installationId,
-        repository,
-        prNumber,
-        resultPR,
-        targetBranch,
-        backportResult.resolvedConflicts
-      );
-
-      await updateJob(jobId, {
-        status: "completed",
-        resultPR,
-      });
-      await addJobLog(jobId, `Backport PR created: #${resultPR}`);
-
-      return { success: true, resultPR };
-    } else {
-      await addJobLog(jobId, `Backport failed: ${backportResult.error}`);
-      await reportFailure(
-        installationId,
-        repository,
-        prNumber,
-        targetBranch,
-        backportResult.error!
-      );
-
-      await updateJob(jobId, {
-        status: "failed",
-        error: backportResult.error,
-      });
-
-      return { success: false, error: backportResult.error };
-    }
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : "Unknown error";
-    await addJobLog(jobId, `Workflow error: ${errorMessage}`);
-    await updateJob(jobId, {
-      status: "failed",
-      error: errorMessage,
-    });
-
-    // Re-throw to let workflow handle it
-    throw error;
-  }
-}
-
-// Step implementations
-
-async function acknowledgeRequest(
-  installationId: number,
-  repository: string,
-  commentId: number
-) {
-  "use step";
-  const octokit = await getInstallationOctokit(installationId);
-  const [owner, repo] = repository.split("/");
-
-  // React to the comment to acknowledge
-  await octokit.rest.reactions.createForIssueComment({
-    owner,
-    repo,
-    comment_id: commentId,
-    content: "eyes",
-  });
-}
-
-async function fetchPRDetails(
-  installationId: number,
-  repository: string,
-  prNumber: number
-): Promise<PRDetails> {
-  "use step";
-  const octokit = await getInstallationOctokit(installationId);
-  const [owner, repo] = repository.split("/");
-
-  const { data: pr } = await octokit.rest.pulls.get({
-    owner,
-    repo,
-    pull_number: prNumber,
-  });
-
-  const { data: commits } = await octokit.rest.pulls.listCommits({
-    owner,
-    repo,
-    pull_number: prNumber,
-  });
-
-  // Get the diff for AI analysis
-  const { data: diff } = await octokit.rest.pulls.get({
-    owner,
-    repo,
-    pull_number: prNumber,
-    mediaType: {
-      format: "diff",
-    },
-  });
-
-  return {
-    title: pr.title,
-    body: pr.body,
-    baseBranch: pr.base.ref,
-    headBranch: pr.head.ref,
-    headSha: pr.head.sha,
-    commits: commits.map((c) => ({
-      sha: c.sha,
-      message: c.commit.message,
-    })),
-    merged: pr.merged,
-    mergeCommitSha: pr.merge_commit_sha,
-    diff: diff as unknown as string,
+  // Create the context that tools will use
+  const context: AgentToolContext = {
+    installationId,
+    repository,
+    jobId,
   };
-}
 
-async function validateTargetBranch(
-  installationId: number,
-  repository: string,
-  targetBranch: string
-): Promise<{ sha: string; context: string }> {
-  "use step";
-  const octokit = await getInstallationOctokit(installationId);
-  const [owner, repo] = repository.split("/");
-
-  try {
-    const { data: branch } = await octokit.rest.repos.getBranch({
-      owner,
-      repo,
-      branch: targetBranch,
-    });
-
-    // Get some context about the target branch (recent commits)
-    const { data: commits } = await octokit.rest.repos.listCommits({
-      owner,
-      repo,
-      sha: targetBranch,
-      per_page: 5,
-    });
-
-    const context = `Target branch: ${targetBranch}\nRecent commits:\n${commits
-      .map((c) => `- ${c.sha.slice(0, 7)}: ${c.commit.message.split("\n")[0]}`)
-      .join("\n")}`;
-
-    return { sha: branch.commit.sha, context };
-  } catch (error) {
-    throw new FatalError(`Target branch '${targetBranch}' does not exist`);
-  }
-}
-
-async function analyzeChangesWithAI(
-  prDetails: PRDetails,
-  targetBranch: string,
-  targetBranchContext: string
-): Promise<AnalysisResult> {
-  "use step";
-
-  // First, analyze the diff
-  const diffAnalysis = await analyzeDiff(
-    prDetails.diff,
-    prDetails.title,
-    prDetails.body
-  );
-
-  // Then, analyze backport feasibility
-  const backportAnalysis = await analyzeBackportFeasibility(
-    prDetails.diff,
-    diffAnalysis,
-    prDetails.baseBranch,
-    targetBranch,
-    targetBranchContext
-  );
-
-  return { diffAnalysis, backportAnalysis };
-}
-
-async function performBackport(
-  installationId: number,
-  repository: string,
-  prNumber: number,
-  prDetails: PRDetails,
-  targetBranch: string,
-  analysis: AnalysisResult,
-  jobId: string
-): Promise<{ success: boolean; branch?: string; error?: string; resolvedConflicts?: number }> {
-  "use step";
-
-  const octokit = await getInstallationOctokit(installationId);
-
-  // Get git credentials for sandbox operations
-  const gitCredentials = await getGitCredentials(octokit);
-
-  // Execute backport in sandbox
-  const result = await executeBackport(
-    {
-      repository,
-      targetBranch,
-      commits: prDetails.commits,
-      prNumber,
-      diffAnalysis: analysis.diffAnalysis,
-      gitCredentials,
+  // Create the DurableAgent with all tools
+  const agent = new DurableAgent({
+    model: "anthropic/claude-sonnet-4",
+    system: BACKPORT_AGENT_SYSTEM_PROMPT,
+    tools: {
+      ...githubTools,
+      ...sandboxTools,
+      ...analysisTools,
+      ...loggingTools,
     },
-    async (message) => {
-      await addJobLog(jobId, `[Sandbox] ${message}`);
+    toolChoice: "auto",
+  });
+
+  // Create the user message with all context the agent needs
+  const userMessage = `Backport PR #${prNumber} from repository ${repository} to branch "${targetBranch}".
+
+The request was triggered by comment ID ${commentId}.
+
+Job ID for logging: ${jobId}
+
+Please execute the full backport workflow:
+1. Acknowledge the request with an eyes reaction
+2. Fetch PR details
+3. Validate the target branch exists
+4. Analyze the diff and backport feasibility
+5. If feasible, execute the backport
+6. Create the result PR or report failure`;
+
+  // Get a writable stream for the workflow output
+  const writable = getWritable<UIMessageChunk>();
+
+  // Run the agent with streaming
+  const result = await agent.stream({
+    messages: [{ role: "user", content: userMessage }],
+    writable,
+    experimental_context: context,
+    collectUIMessages: true,
+  });
+
+  // Parse the result from the agent's final messages
+  return parseAgentResult(result);
+}
+
+/**
+ * Parse the agent's result to extract backport outcome
+ */
+function parseAgentResult(
+  result: { messages: Array<{ role: string; content: unknown }> }
+): BackportResult {
+  // Look through the messages to find tool results
+  for (const message of result.messages) {
+    if (message.role === "tool" && Array.isArray(message.content)) {
+      for (const part of message.content) {
+        const toolPart = part as { type?: string; toolName?: string; result?: unknown };
+
+        // Check for createPullRequest results
+        if (toolPart.toolName === "createPullRequest" && toolPart.result) {
+          const prResult = toolPart.result as { number?: number };
+          if (prResult.number) {
+            return {
+              success: true,
+              resultPR: prResult.number,
+            };
+          }
+        }
+
+        // Check for updateJobStatus with failure
+        if (toolPart.toolName === "updateJobStatus" && toolPart.result) {
+          const statusResult = toolPart.result as { success?: boolean };
+          // Look at the tool call input to determine status
+        }
+      }
     }
-  );
-
-  if (result.resolvedConflicts && result.resolvedConflicts > 0) {
-    await addJobLog(
-      jobId,
-      `AI resolved ${result.resolvedConflicts} conflict(s) automatically`
-    );
   }
 
-  return result;
-}
+  // Check for any error indicators in the final assistant message
+  const lastMessage = result.messages[result.messages.length - 1];
+  if (lastMessage?.role === "assistant") {
+    const content = typeof lastMessage.content === "string"
+      ? lastMessage.content
+      : "";
 
-async function createBackportPR(
-  installationId: number,
-  repository: string,
-  sourcePR: number,
-  targetBranch: string,
-  backportBranch: string,
-  description: string
-): Promise<number> {
-  "use step";
-  const octokit = await getInstallationOctokit(installationId);
-  const [owner, repo] = repository.split("/");
+    // Try to infer from the message content
+    if (content.toLowerCase().includes("success") && content.includes("#")) {
+      const prMatch = content.match(/#(\d+)/);
+      if (prMatch) {
+        return {
+          success: true,
+          resultPR: parseInt(prMatch[1], 10),
+        };
+      }
+    }
 
-  const { data: pr } = await octokit.rest.pulls.create({
-    owner,
-    repo,
-    title: `[Backport ${targetBranch}] Changes from #${sourcePR}`,
-    head: backportBranch,
-    base: targetBranch,
-    body: description,
-  });
-
-  return pr.number;
-}
-
-async function reportSuccess(
-  installationId: number,
-  repository: string,
-  prNumber: number,
-  resultPR: number,
-  targetBranch: string,
-  resolvedConflicts?: number
-) {
-  "use step";
-  const octokit = await getInstallationOctokit(installationId);
-  const [owner, repo] = repository.split("/");
-
-  let message = `## ✅ Backport Successful\n\n`;
-  message += `Successfully backported to \`${targetBranch}\`.\n\n`;
-  message += `**Result:** #${resultPR}\n`;
-
-  if (resolvedConflicts && resolvedConflicts > 0) {
-    message += `\n> **Note:** ${resolvedConflicts} conflict(s) were automatically resolved by AI.\n`;
-    message += `> Please review the changes carefully before merging.\n`;
+    if (content.toLowerCase().includes("fail") || content.toLowerCase().includes("error")) {
+      return {
+        success: false,
+        error: content.slice(0, 500) || "Backport failed",
+      };
+    }
   }
 
-  message += `\n---\n<sub>Created by [agent-backport](https://github.com/gr2m/agent-backport)</sub>`;
+  // Try to find PR number from tool calls
+  for (const message of result.messages) {
+    if (message.role === "assistant" && Array.isArray(message.content)) {
+      for (const part of message.content) {
+        const toolCall = part as { type?: string; toolName?: string; args?: unknown };
+        if (toolCall.type === "tool-call" && toolCall.toolName === "updateJobStatus") {
+          const args = toolCall.args as { status?: string; resultPR?: number; error?: string } | undefined;
+          if (args?.status === "completed" && args?.resultPR) {
+            return {
+              success: true,
+              resultPR: args.resultPR,
+            };
+          }
+          if (args?.status === "failed") {
+            return {
+              success: false,
+              error: args.error || "Backport failed",
+            };
+          }
+        }
+      }
+    }
+  }
 
-  await octokit.rest.issues.createComment({
-    owner,
-    repo,
-    issue_number: prNumber,
-    body: message,
-  });
-}
-
-async function reportFailure(
-  installationId: number,
-  repository: string,
-  prNumber: number,
-  targetBranch: string,
-  error: string
-) {
-  "use step";
-  const octokit = await getInstallationOctokit(installationId);
-  const [owner, repo] = repository.split("/");
-
-  let message = `## ❌ Backport Failed\n\n`;
-  message += `Failed to backport to \`${targetBranch}\`.\n\n`;
-  message += `**Error:**\n\`\`\`\n${error}\n\`\`\`\n\n`;
-  message += `### Manual Backport Instructions\n\n`;
-  message += `\`\`\`bash\n`;
-  message += `git fetch origin ${targetBranch}\n`;
-  message += `git checkout -b backport-pr-${prNumber}-to-${targetBranch} origin/${targetBranch}\n`;
-  message += `git cherry-pick -x <commit-sha>  # Cherry-pick each commit from this PR\n`;
-  message += `git push origin backport-pr-${prNumber}-to-${targetBranch}\n`;
-  message += `\`\`\`\n\n`;
-  message += `---\n<sub>Created by [agent-backport](https://github.com/gr2m/agent-backport)</sub>`;
-
-  await octokit.rest.issues.createComment({
-    owner,
-    repo,
-    issue_number: prNumber,
-    body: message,
-  });
+  // Default to unknown outcome
+  return {
+    success: false,
+    error: "Could not determine backport outcome from agent response",
+  };
 }
