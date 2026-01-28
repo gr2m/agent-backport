@@ -101,14 +101,6 @@ async function handleIssueComment(body: any, deliveryId: string) {
         `[${deliveryId}] User ${requestedBy} does not have write access (permission: ${permission.permission})`
       );
 
-      // React with thumbs down to indicate permission denied
-      await octokit.rest.reactions.createForIssueComment({
-        owner,
-        repo,
-        comment_id: commentId,
-        content: "-1",
-      });
-
       await octokit.rest.issues.createComment({
         owner,
         repo,
