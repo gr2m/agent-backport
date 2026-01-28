@@ -1,13 +1,4 @@
-// Job storage for backport operations
-// TODO: Re-enable Upstash Redis for persistence
-// import { Redis } from "@upstash/redis";
-
-// const redis = new Redis({
-//   url: process.env.UPSTASH_REDIS_REST_URL!,
-//   token: process.env.UPSTASH_REDIS_REST_TOKEN!,
-// });
-
-// In-memory storage (temporary - does not persist across requests/deployments)
+// Job storage for backport operations (in-memory, does not persist across deployments)
 const jobStore = new Map<string, BackportJob>();
 
 export interface BackportJob {
@@ -25,8 +16,6 @@ export interface BackportJob {
   error?: string;
   logs: string[];
 }
-
-// Redis serialization types removed - using in-memory storage
 
 export function generateJobId(): string {
   return `bp_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
@@ -47,10 +36,6 @@ export async function createJob(
 
   jobStore.set(job.id, job);
   return job;
-}
-
-export async function getJob(id: string): Promise<BackportJob | null> {
-  return jobStore.get(id) || null;
 }
 
 export async function updateJob(
@@ -80,36 +65,4 @@ export async function addJobLog(id: string, message: string): Promise<void> {
     job.updatedAt = new Date();
     jobStore.set(id, job);
   }
-}
-
-export async function listJobs(options?: {
-  repository?: string;
-  status?: BackportJob["status"];
-  limit?: number;
-}): Promise<BackportJob[]> {
-  const limit = options?.limit || 50;
-
-  // Get all jobs sorted by creation time (newest first)
-  let result = Array.from(jobStore.values()).sort(
-    (a, b) => b.createdAt.getTime() - a.createdAt.getTime()
-  );
-
-  if (options?.repository) {
-    result = result.filter((j) => j.repository === options.repository);
-  }
-
-  if (options?.status) {
-    result = result.filter((j) => j.status === options.status);
-  }
-
-  return result.slice(0, limit);
-}
-
-export async function listJobsForUser(
-  accessToken: string,
-  limit?: number
-): Promise<BackportJob[]> {
-  // TODO: Filter by repositories the user has access to
-  // For now, return all jobs
-  return listJobs({ limit });
 }
