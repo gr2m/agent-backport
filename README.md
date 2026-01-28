@@ -54,13 +54,13 @@ An AI-powered GitHub App that intelligently backports pull requests across branc
 
 ### 2. Deploy to Vercel
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/gr2m/agent-backport)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/agent-backport/app)
 
 Or deploy manually:
 
 ```bash
 # Clone the repository
-git clone https://github.com/gr2m/agent-backport.git
+git clone https://github.com/agent-backport/app.git
 cd agent-backport
 
 # Install dependencies

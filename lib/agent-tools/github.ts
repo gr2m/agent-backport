@@ -243,8 +243,8 @@ export const createProgressComment = tool({
     const [owner, repo] = repository.split("/");
 
     const footer = jobUrl
-      ? `---\n<sub>[agent-backport](https://github.com/gr2m/agent-backport) • [View logs](${jobUrl})</sub>`
-      : `---\n<sub>[agent-backport](https://github.com/gr2m/agent-backport)</sub>`;
+      ? `---\n<sub>[agent-backport](https://github.com/agent-backport/app) • [View logs](${jobUrl})</sub>`
+      : `---\n<sub>[agent-backport](https://github.com/agent-backport/app)</sub>`;
 
     const body = `## Backport in Progress
 

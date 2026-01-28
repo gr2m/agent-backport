@@ -95,7 +95,7 @@ Update the progress comment after each major step. Use checkboxes to show progre
 ⏳ **Status:** Analyzing diff complexity...
 
 ---
-<sub>[agent-backport](https://github.com/gr2m/agent-backport) • [View logs]({jobUrl})</sub>
+<sub>[agent-backport](https://github.com/agent-backport/app) • [View logs]({jobUrl})</sub>
 \`\`\`
 
 ## Final Success Comment Format
@@ -117,7 +117,7 @@ Replace the progress comment with this when successful:
 > Please review the changes carefully before merging.
 
 ---
-<sub>[agent-backport](https://github.com/gr2m/agent-backport) • [View logs]({jobUrl})</sub>
+<sub>[agent-backport](https://github.com/agent-backport/app) • [View logs]({jobUrl})</sub>
 \`\`\`
 
 ## Final Failure Comment Format
@@ -147,7 +147,7 @@ git push origin backport-pr-{prNumber}-to-{targetBranch}
 \`\`\`
 
 ---
-<sub>[agent-backport](https://github.com/gr2m/agent-backport) • [View logs]({jobUrl})</sub>
+<sub>[agent-backport](https://github.com/agent-backport/app) • [View logs]({jobUrl})</sub>
 \`\`\`
 
 ## Important Notes
