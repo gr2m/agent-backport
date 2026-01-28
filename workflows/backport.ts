@@ -29,7 +29,7 @@ export interface BackportResult {
  * Main backport workflow using DurableAgent
  *
  * The agent autonomously handles the entire backport process:
- * 1. Acknowledges the request with eyes reaction
+ * 1. Creates a progress comment with task checklist
  * 2. Fetches PR details and validates target branch
  * 3. Analyzes changes and backport feasibility with AI
  * 4. Executes the backport in a sandbox (cherry-pick, conflict resolution)
@@ -71,7 +71,7 @@ The request was triggered by comment ID ${commentId}.
 Job ID for logging: ${jobId}
 
 Please execute the full backport workflow:
-1. Acknowledge the request with an eyes reaction
+1. Create a progress comment with task checklist
 2. Fetch PR details
 3. Validate the target branch exists
 4. Analyze the diff and backport feasibility
