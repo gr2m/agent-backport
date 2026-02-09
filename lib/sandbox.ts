@@ -448,6 +448,245 @@ async function resolveConflictWithAI(
 }
 
 /**
+ * Configuration for conflict resolution in a branch
+ */
+export interface ConflictResolutionConfig {
+  repository: string;
+  prNumber: number;
+  branchName: string;
+  baseBranch: string;
+  gitCredentials: {
+    username: string;
+    token: string;
+  };
+}
+
+/**
+ * Result of conflict resolution operation
+ */
+export interface ConflictResolutionResult {
+  success: boolean;
+  resolvedFiles?: string[];
+  commitSha?: string;
+  error?: string;
+}
+
+/**
+ * Resolve conflicts in an existing branch
+ */
+export async function resolveConflictsInBranch(
+  config: ConflictResolutionConfig,
+  onLog: (message: string) => Promise<void>
+): Promise<ConflictResolutionResult> {
+  let sandbox: Sandbox | null = null;
+
+  try {
+    await onLog("Creating sandbox environment for conflict resolution...");
+
+    // Create sandbox with git repository
+    sandbox = await Sandbox.create({
+      runtime: "node24",
+      timeout: 5 * 60 * 1000, // 5 minutes
+    });
+
+    await onLog(`Sandbox created: ${sandbox.sandboxId}`);
+
+    // Configure git
+    await onLog("Configuring git...");
+    await runGitCommand(
+      sandbox,
+      ["config", "--global", "user.email", "agent-backport@vercel.app"],
+      "/vercel/sandbox",
+      onLog
+    );
+    await runGitCommand(
+      sandbox,
+      ["config", "--global", "user.name", "Agent Backport"],
+      "/vercel/sandbox",
+      onLog
+    );
+
+    // Clone the repository
+    const repoUrl = `https://${config.gitCredentials.username}:${config.gitCredentials.token}@github.com/${config.repository}.git`;
+    await onLog(`Cloning repository ${config.repository}...`);
+
+    const cloneResult = await runGitCommand(
+      sandbox,
+      ["clone", "--depth", "50", repoUrl, "repo"],
+      "/vercel/sandbox",
+      onLog,
+      { maskToken: config.gitCredentials.token }
+    );
+
+    if (cloneResult.exitCode !== 0) {
+      throw new Error(`Failed to clone repository: ${cloneResult.stderr}`);
+    }
+
+    const repoPath = "/vercel/sandbox/repo";
+
+    // Fetch the PR branch with conflicts
+    await onLog(`Fetching branch with conflicts: ${config.branchName}...`);
+    const fetchBranchResult = await runGitCommand(
+      sandbox,
+      ["fetch", "origin", `${config.branchName}:${config.branchName}`],
+      repoPath,
+      onLog
+    );
+
+    if (fetchBranchResult.exitCode !== 0) {
+      throw new Error(
+        `Failed to fetch branch '${config.branchName}': ${fetchBranchResult.stderr}`
+      );
+    }
+
+    // Checkout the branch
+    await onLog(`Checking out branch: ${config.branchName}...`);
+    const checkoutResult = await runGitCommand(
+      sandbox,
+      ["checkout", config.branchName],
+      repoPath,
+      onLog
+    );
+
+    if (checkoutResult.exitCode !== 0) {
+      throw new Error(`Failed to checkout branch: ${checkoutResult.stderr}`);
+    }
+
+    // Check for files with conflict markers
+    await onLog("Searching for files with conflict markers...");
+    const filesResult = await runGitCommand(
+      sandbox,
+      ["ls-files"],
+      repoPath,
+      onLog
+    );
+
+    if (filesResult.exitCode !== 0) {
+      throw new Error(`Failed to list files: ${filesResult.stderr}`);
+    }
+
+    const allFiles = filesResult.stdout.trim().split("\n").filter(f => f);
+    const conflictFiles: string[] = [];
+
+    // Check each file for conflict markers
+    for (const file of allFiles) {
+      const fileBuffer = await sandbox.readFileToBuffer({
+        path: file,
+        cwd: repoPath,
+      });
+
+      if (!fileBuffer) continue;
+
+      const content = fileBuffer.toString("utf-8");
+      if (content.includes("<<<<<<<") && content.includes(">>>>>>>")) {
+        conflictFiles.push(file);
+        await onLog(`Found conflict markers in: ${file}`);
+      }
+    }
+
+    if (conflictFiles.length === 0) {
+      await onLog("No conflict markers found in any files");
+      return {
+        success: true,
+        resolvedFiles: [],
+        error: "No conflicts found to resolve",
+      };
+    }
+
+    await onLog(`Found ${conflictFiles.length} file(s) with conflicts`);
+
+    // Get the change intent from the PR
+    const changeIntent = `Resolving conflicts in PR #${config.prNumber} backport to ${config.baseBranch}`;
+    const resolvedFiles: string[] = [];
+
+    // Resolve each conflicted file
+    for (const file of conflictFiles) {
+      await onLog(`Resolving conflicts in: ${file}`);
+
+      const resolved = await resolveConflictWithAI(
+        sandbox,
+        repoPath,
+        file,
+        `Conflict resolution for PR #${config.prNumber}`,
+        changeIntent,
+        onLog
+      );
+
+      if (resolved) {
+        resolvedFiles.push(file);
+        await onLog(`Successfully resolved conflict in: ${file}`);
+      } else {
+        await onLog(`Could not auto-resolve conflict in: ${file}`);
+        throw new Error(
+          `Could not resolve merge conflict in ${file}. Manual intervention required.`
+        );
+      }
+    }
+
+    // Commit the resolved changes
+    await onLog("Committing resolved conflicts...");
+    const commitResult = await runGitCommand(
+      sandbox,
+      ["commit", "-m", "Resolve conflicts in backport"],
+      repoPath,
+      onLog
+    );
+
+    if (commitResult.exitCode !== 0) {
+      throw new Error(`Failed to commit resolved changes: ${commitResult.stderr}`);
+    }
+
+    // Get the commit SHA
+    const shaResult = await runGitCommand(
+      sandbox,
+      ["rev-parse", "HEAD"],
+      repoPath,
+      onLog
+    );
+
+    const commitSha = shaResult.stdout.trim();
+    await onLog(`Created commit: ${commitSha.slice(0, 7)}`);
+
+    // Push the changes
+    await onLog(`Pushing resolved changes to ${config.branchName}...`);
+    const pushResult = await runGitCommand(
+      sandbox,
+      ["push", "origin", config.branchName],
+      repoPath,
+      onLog
+    );
+
+    if (pushResult.exitCode !== 0) {
+      throw new Error(`Failed to push changes: ${pushResult.stderr}`);
+    }
+
+    await onLog("Conflict resolution completed successfully!");
+
+    return {
+      success: true,
+      resolvedFiles,
+      commitSha,
+    };
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : "Unknown error";
+    await onLog(`Conflict resolution failed: ${errorMessage}`);
+    return {
+      success: false,
+      error: errorMessage,
+    };
+  } finally {
+    // Clean up sandbox
+    if (sandbox) {
+      try {
+        await sandbox.stop();
+      } catch (e) {
+        // Ignore cleanup errors
+      }
+    }
+  }
+}
+
+/**
  * Get installation token for git operations
  */
 export async function getGitCredentials(

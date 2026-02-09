@@ -3,6 +3,7 @@ import { z } from "zod";
 import { getInstallationOctokit } from "@/lib/github";
 import {
   executeBackport as executeBackportInSandbox,
+  resolveConflictsInBranch as resolveConflictsInBranchInSandbox,
   getGitCredentials,
   type BackportConfig,
 } from "@/lib/sandbox";
@@ -96,6 +97,53 @@ export const executeBackport = tool({
   },
 });
 
+/**
+ * Resolve conflicts in an existing backport branch
+ * This fetches the conflicted branch, detects conflict markers, uses AI to resolve them, and pushes
+ */
+export const resolveConflictsInBranch = tool({
+  description:
+    "Resolve merge conflicts in an existing backport branch. Fetches the PR branch, detects conflict markers in files, uses AI to analyze and resolve each conflict, commits the changes, and pushes to remote.",
+  inputSchema: z.object({
+    prNumber: z.number().describe("The PR number with conflicts"),
+    branchName: z.string().describe("The branch name containing conflicts"),
+    baseBranch: z.string().describe("The base branch being merged into"),
+  }),
+  execute: async function (
+    { prNumber, branchName, baseBranch },
+    { experimental_context }
+  ) {
+    "use step";
+
+    const { installationId, repository, jobId } = experimental_context as SandboxToolContext;
+    const octokit = await getInstallationOctokit(installationId);
+    const gitCredentials = await getGitCredentials(octokit);
+
+    // Create logging callback
+    const onLog = async (message: string) => {
+      await addJobLog(jobId, `[Conflict Resolution] ${message}`);
+    };
+
+    const config = {
+      repository,
+      prNumber,
+      branchName,
+      baseBranch,
+      gitCredentials,
+    };
+
+    const result = await resolveConflictsInBranchInSandbox(config, onLog);
+
+    return {
+      success: result.success,
+      resolvedFiles: result.resolvedFiles,
+      commitSha: result.commitSha,
+      error: result.error,
+    };
+  },
+});
+
 export const sandboxTools = {
   executeBackport,
+  resolveConflictsInBranch,
 };
